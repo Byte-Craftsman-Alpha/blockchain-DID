@@ -29,6 +29,3 @@ class Blockchain:
         latest_block = self.get_latest_block()
         new_block = Block(len(self.chain), datetime.now().isoformat(), data, latest_block.hash)
         self.chain.append(new_block)
-
-a = Blockchain()
-print(a.add_block("Aditya"))
