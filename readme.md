@@ -92,36 +92,74 @@ Each when there will be a transaction with the credentials, a `hash` will be cre
 import sqlite3
 import blockChainAlgo
 from datetime import datetime
+import random
+from pydantic import BaseModel
+import string
+
+def generateDID():
+    now = datetime.now()
+    characters = string.ascii_letters + string.digits  # Letters (lowercase and uppercase) and digits
+    return ''.join(now.strftime("%d%m%Y%H%M%S").split() + [random.choice(characters) for _ in range(16)])
 
 # save transaction and generate hash
-def preserveTransaction(data: object):
+def preserveTransaction(data: object, user: str):
     """
     use your credential to create hash code
     this will also save the transaction into database for further access
     """
     db = sqlite3.connect("transaction_record.db")
     curs = db.cursor()
-    curs.execute("CREATE TABLE IF NOT EXISTs TRANSACTIONS (HASH, SERVER, ACCESSED_CREDENTIAL, DATE, TIME)")
+    curs.execute("CREATE TABLE IF NOT EXISTs TRANSACTIONS (USER, HASH, SERVER, ACCESSED_CREDENTIAL, DATE, TIME)")
 
     node = blockChainAlgo.Blockchain()
     node.add_block(data=data)
     hash = node.create_genesis_block().hash
-    curs.execute("INSERT INTO TRANSACTIONS (HASH, SERVER, ACCESSED_CREDENTIAL, DATE, TIME) VALUES (?, ?, ?, ?, ?)", (hash, "google.com", "name, dob, contact", datetime.now().strftime("%d-%m-%Y"), datetime.now().strftime("%H:%M:%S")))
+    curs.execute("INSERT INTO TRANSACTIONS (USER, HASH, SERVER, ACCESSED_CREDENTIAL, DATE, TIME) VALUES (?, ?, ?, ?, ?, ?)", (user, hash, data.requestingServer, str(list(data.credentials.keys())), datetime.now().strftime("%d-%m-%Y"), datetime.now().strftime("%H:%M:%S")))
     db.commit()
     return hash
 
 # return whole records with matching hash
 def getTransaction(hash: str):
+    """
+    get the information about transaction through hash key
+    """
     db = sqlite3.connect("transaction_record.db")
     curs = db.cursor()
     curs.execute("SELECT * FROM TRANSACTIONS WHERE HASH = ?", (hash, ))
     return curs.fetchall()
 
-def getTransactionList():
+def getTransactionList(user: str):
+    """
+    get list of all transaction from any user and any hash key
+    """
     db = sqlite3.connect("transaction_record.db")
     curs = db.cursor()
-    curs.execute("SELECT * FROM TRANSACTIONS")
+    curs.execute("SELECT * FROM TRANSACTIONS WHERE USER = ?", (user, ))
     return curs.fetchall()
+
+def getTranscationInfo(hash: str):
+    """
+    get transaction information through hash key
+    """
+    db = sqlite3.connect("transaction_record.db")
+    curs = db.cursor()
+    curs.execute("SELECT * FROM TRANSACTIONS WHERE HASH = ?", (hash, ))
+    return curs.fetchall()
+
+class demoCredential(BaseModel):
+    user: str
+    credential: object
+
+class credentialRequest(BaseModel):
+    AuthID: str
+    credentials: list
+
+class viewTransactionCredentials(BaseModel):
+    AuthID: str
+
+class hashProperty(BaseModel):
+    hash: str
+
 ```
 > `blockChainAlgo.py`
 ```python
@@ -156,10 +194,12 @@ class Blockchain:
         latest_block = self.get_latest_block()
         new_block = Block(len(self.chain), datetime.now().isoformat(), data, latest_block.hash)
         self.chain.append(new_block)
+
 ```
 > `mongoBD.py`
 ```python
 from pymongo import MongoClient
+from pymongo.errors import DuplicateKeyError
 
 class MongoDBHandler:
     def __init__(self, uri="mongodb://localhost:27017/", database_name="test_db"):
@@ -170,59 +210,127 @@ class MongoDBHandler:
         self.db = self.client[database_name]
         print(f"Connected to MongoDB database: {database_name}")
 
-    def insert_data(self, collection_name, data):
+    def create_unique_index(self, collection_name, field_name):
         """
-        Insert a single document or multiple documents into a collection.
+        Create a unique index for a specific field in a collection.
         """
         collection = self.db[collection_name]
-        if isinstance(data, list):
-            result = collection.insert_many(data)
-            return result.inserted_ids
-        else:
-            result = collection.insert_one(data)
-            return result.inserted_id
+        result = collection.create_index([(field_name, 1)], unique=True)
+        print(f"Unique index created for field '{field_name}' in collection '{collection_name}'. Index name: {result}")
+
+    def fetch_credentials_by_keys(self,keys_to_search: list, collection_name, filter_criteria=None):
+        """
+        Fetch documents and search for specific keys, including in nested dictionaries.
+        """
+        def extract_keys(document, keys):
+            """
+            Recursively search for keys in a document (including nested).
+            """
+            result = {key: None for key in keys}  # Initialize with None
+            stack = [(document, key) for key in keys]  # Stack for DFS
+            
+            while stack:
+                current, key_to_find = stack.pop()
+                if isinstance(current, dict):
+                    # Check if the key exists at the current level
+                    if key_to_find in current:
+                        result[key_to_find] = current[key_to_find]
+                    else:
+                        # Push children to the stack for further exploration
+                        stack.extend([(value, key_to_find) for value in current.values() if isinstance(value, (dict, list))])
+                elif isinstance(current, list):
+                    # Handle list elements
+                    stack.extend([(element, key_to_find) for element in current if isinstance(element, (dict, list))])
+            return result
+        
+        # Fetch documents based on filter_criteria
+        collection = self.db[collection_name]
+        try:
+            if filter_criteria is None:
+                filter_criteria = {}
+            documents = list(collection.find(filter_criteria))
+            
+            # Extract requested keys from each document
+            results = []
+            for doc in documents:
+                result = extract_keys(doc, keys_to_search)
+                results.append(result)
+            return results
+        
+        except Exception as e:
+            print(f"Error while fetching credentials by keys: {e}")
+            return []
+
+    def insert_data(self, collection_name, data):
+        """
+        Insert a single document or multiple documents into a collection with duplicate prevention.
+        """
+        collection = self.db[collection_name]
+        try:
+            if isinstance(data, list):
+                result = collection.insert_many(data, ordered=False)  # `ordered=False` skips duplicates
+                return result.inserted_ids
+            else:
+                result = collection.insert_one(data)
+                return result.inserted_id
+        except DuplicateKeyError as e:
+            print(f"Duplicate entry detected: {e}")
+            return None
 
     def update_data(self, collection_name, filter_criteria, update_values, update_one=True):
         """
         Update document(s) in a collection.
         """
         collection = self.db[collection_name]
-        if update_one:
-            result = collection.update_one(filter_criteria, {"$set": update_values})
+        try:
+            if update_one:
+                result = collection.update_one(filter_criteria, {"$set": update_values})
+            else:
+                result = collection.update_many(filter_criteria, {"$set": update_values})
             return result.modified_count
-        else:
-            result = collection.update_many(filter_criteria, {"$set": update_values})
-            return result.modified_count
+        except Exception as e:
+            print(f"Error while updating: {e}")
+            return 0
 
     def fetch_data(self, collection_name, filter_criteria=None, projection=None):
         """
         Fetch document(s) from a collection.
         """
         collection = self.db[collection_name]
-        if filter_criteria is None:
-            filter_criteria = {}
-        documents = collection.find(filter_criteria, projection)
-        return list(documents)
+        try:
+            if filter_criteria is None:
+                filter_criteria = {}
+            documents = collection.find(filter_criteria, projection)
+            return list(documents)
+        except Exception as e:
+            print(f"Error while fetching data: {e}")
+            return []
 
     def delete_data(self, collection_name, filter_criteria, delete_one=True):
         """
         Delete document(s) from a collection.
         """
         collection = self.db[collection_name]
-        if delete_one:
-            result = collection.delete_one(filter_criteria)
+        try:
+            if delete_one:
+                result = collection.delete_one(filter_criteria)
+            else:
+                result = collection.delete_many(filter_criteria)
             return result.deleted_count
-        else:
-            result = collection.delete_many(filter_criteria)
-            return result.deleted_count
+        except Exception as e:
+            print(f"Error while deleting: {e}")
+            return 0
 
     def drop_collection(self, collection_name):
         """
         Drop a collection from the database.
         """
-        collection = self.db[collection_name]
-        collection.drop()
-        print(f"Collection '{collection_name}' dropped.")
+        try:
+            collection = self.db[collection_name]
+            collection.drop()
+            print(f"Collection '{collection_name}' dropped.")
+        except Exception as e:
+            print(f"Error while dropping collection: {e}")
 
     def close_connection(self):
         """
@@ -230,38 +338,11 @@ class MongoDBHandler:
         """
         self.client.close()
         print("MongoDB connection closed.")
+
 ```
 
 ## Documentation and Tutorial
-> Generate View of your Transactions
-```javascript
-var url = "http://127.0.0.1:8000/view_transaction/";
 
-var data = {
-    AuthID: "10012025013947uEKIeKlmFYx1nNct", // Your Auth key
-};
-
-// Making the POST request
-fetch(url, {
-    method: "POST",
-    headers: {
-        "Content-Type": "application/json"
-    },
-    body: JSON.stringify(data)
-})
-    .then(response => {
-        if (!response.ok) {
-            throw new Error(`HTTP error! Status: ${response.status}`);
-        }
-        return response.json(); // Parse the JSON response
-    })
-    .then(result => {
-        console.log("Server Response:", result); // Handle the result
-    })
-    .catch(error => {
-        console.error("Error:", error); // Handle any errors
-    });
-``` 
 > Generate your Auth Key
 ```javascript
 var url = "http://127.0.0.1:8000/generate_token/";
@@ -403,9 +484,39 @@ fetch(url, {
         return response.json(); // Parse the JSON response
     })
     .then(result => {
-        console.log("Server Response:", result); // Handle the result
+        console.table(result); // Handle the result
     })
     .catch(error => {
         console.error("Error:", error); // Handle any errors
     });
 ```
+
+> Generate View of your Transactions
+```javascript
+var url = "http://127.0.0.1:8000/view_transaction/";
+
+var data = {
+    AuthID: "10012025013947uEKIeKlmFYx1nNct", // Your Auth key
+};
+
+// Making the POST request
+fetch(url, {
+    method: "POST",
+    headers: {
+        "Content-Type": "application/json"
+    },
+    body: JSON.stringify(data)
+})
+    .then(response => {
+        if (!response.ok) {
+            throw new Error(`HTTP error! Status: ${response.status}`);
+        }
+        return response.json(); // Parse the JSON response
+    })
+    .then(result => {
+        console.log("Server Response:", result); // Handle the result
+    })
+    .catch(error => {
+        console.error("Error:", error); // Handle any errors
+    });
+``` 
